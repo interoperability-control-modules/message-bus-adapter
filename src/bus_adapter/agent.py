@@ -45,8 +45,8 @@ except PackageNotFoundError:
     from volttron.platform.messaging.health import STATUS_BAD, STATUS_GOOD
     from volttron.platform.vip.agent import Agent, Core, RPC
 
-from interoperability import openfmb_bus
-from interoperability.resource import ResourceData
+from icm.resources.openfmb import bus as openfmb_bus
+from icm.resources.resource import ResourceData
 
 from protocol_proxy.ipc import callback, ProtocolHeaders, ProtocolProxyMessage, ProtocolProxyPeer
 from protocol_proxy.manager.gevent import GeventProtocolProxyManager
@@ -67,7 +67,7 @@ class MessageBusAdapter(Agent):
     ``adapters`` describes one remote bus and is run in its own proxy subprocess.
 
     The remote's topics live on the VOLTTRON bus under the remote topic itself, in the alias
-    format's JSON form with the headers of ``interoperability.openfmb_bus`` (OpenFMB on the
+    format's JSON form with the headers of ``icm.resources.openfmb.bus`` (OpenFMB on the
     VOLTTRON bus): an inbound message is decoded with the alias registered as exactly its topic
     (``platform.presentation`` resolves it strictly) and republished on that topic with this
     adapter as origin; local publications on the topics of ``local_subscriptions`` (or sent by
@@ -118,6 +118,8 @@ class MessageBusAdapter(Agent):
                                     ' is not supported. Restart the agent. Keeping the existing configuration.')
             return
         self.config = new_config
+        if action == 'UPDATE':
+            self._refresh_resources()
         if not self.config.bus_type:
             _log.warning('No bus_type configured. The Message Bus Adapter is idle until a configuration is provided.')
             return
@@ -203,6 +205,29 @@ class MessageBusAdapter(Agent):
         if self.ppm is not None:
             self.ppm.stop()
 
+    def _refresh_resources(self) -> None:
+        """Re-resolve every cached resource on a reconfiguration, so an alias, transform or parameter changed in the
+        presentation service reaches a running adapter. A resource that no longer resolves leaves the cache; the next
+        message on its topic looks it up afresh. Relays hold the resource objects, so a successful reload reaches them."""
+        for key, resource in list(self.resources.items()):
+            definition = self.config.definitions.get(key[0])
+            try:
+                if resource.origin == 'local' and definition is None:
+                    ok = False                              # the local definition was removed: resolve afresh next time
+                elif definition is not None:
+                    if resource.origin != 'local':          # a definition now covers a topic the service used to resolve
+                        self.resources[key] = ResourceData.from_definition(self, key[0], definition)
+                        continue
+                    ok = resource.reload(definition)
+                else:
+                    ok = resource.reload()
+            except Exception as e:                      # the service may be down mid-reconfiguration
+                ok = False
+                _log.warning(f'Could not refresh resource {key[0]}: {e!r}')
+            if not ok:
+                self.resources.pop(key, None)
+                _log.warning(f'Resource {key[0]} no longer resolves; it will be looked up again on its next message.')
+
     ###################
     # Remote -> Local
     ###################
@@ -214,7 +239,11 @@ class MessageBusAdapter(Agent):
         route a foreign message onto a parent resource."""
         key = (topic, strict)
         if not (resource_data := self.resources.get(key)):
-            if resource_data := ResourceData.lookup(self, topic, delimiter, strict=strict):
+            if (definition := self.config.definitions.get(topic)) is not None:
+                resource_data = ResourceData.from_definition(self, topic, definition)     # declared here: no service call
+            else:
+                resource_data = ResourceData.lookup(self, topic, delimiter, strict=strict)
+            if resource_data:
                 self.resources[key] = resource_data
             else:
                 _log.warning(f'Unable to find Data Resource matching {topic}')
@@ -328,6 +357,13 @@ class MessageBusAdapter(Agent):
     ###################
     # RPC Interface
     ###################
+
+    @RPC.export
+    def local_definitions(self) -> dict:
+        """The resources this adapter declares itself rather than resolving through the presentation service, by remote
+        topic, as configured. A configuration UI that reads the store sees only the service's resources; this is how it
+        learns about an agent's own."""
+        return {topic: d.model_dump(mode='json') for topic, d in self.config.definitions.items()}
 
     @RPC.export
     def list_remotes(self) -> list[list]:

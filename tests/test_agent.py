@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 
-from interoperability import openfmb_bus
+from icm.resources.openfmb import bus as openfmb_bus
 
 from bus_adapter import agent as agent_module
 from bus_adapter.agent import MessageBusAdapter
@@ -294,7 +294,7 @@ def test_handle_publish_local_decodes_binary_payloads(adapter):
 # ---- OpenFMB on the VOLTTRON bus (relay, the only mode) -------------------------------------------------------------------------
 
 def test_relay_mode_republishes_inbound_messages_on_their_own_topic_with_headers(adapter):
-    from interoperability import openfmb_bus
+    from icm.resources.openfmb import bus as openfmb_bus
     adapter.config = MessageBusAdapterConfig(bus_type='mqtt', adapters=[{'name': 'r1', 'host': 'h', 'port': 1}])
     adapter.core.identity = 'platform.bus_adapter'
     manager = adapter.ppm
@@ -316,7 +316,7 @@ def test_relay_mode_republishes_inbound_messages_on_their_own_topic_with_headers
 
 
 def test_relay_mode_forwards_local_publications_except_its_own(adapter):
-    from interoperability import openfmb_bus
+    from icm.resources.openfmb import bus as openfmb_bus
     adapter.config = MessageBusAdapterConfig(bus_type='nats', adapters=[{'name': 'r1', 'servers': 'nats://x:4222'}])
     adapter.core.identity = 'platform.bus_adapter'
     manager = adapter.ppm
@@ -342,4 +342,38 @@ def test_relay_mode_forwards_local_publications_except_its_own(adapter):
     relay('pubsub', 'x', 'bus', 'openfmb/essmodule/ESSReadingProfile/m1/deeper', {}, {})                   # a longer topic under the prefix
     manager.send.assert_not_called()
 
+
+def test_update_reconfiguration_refreshes_cached_resources(adapter):
+    """A configuration update re-resolves every cached resource and drops the ones that no longer resolve."""
+    from unittest import mock
+    keep, gone = mock.MagicMock(), mock.MagicMock()
+    keep.reload.return_value, gone.reload.return_value = True, False
+    adapter.resources = {('site/a', False): keep, ('site/b', False): gone}
+    adapter.configure_main(None, 'UPDATE', {'bus_type': adapter.config.bus_type or 'mqtt', 'adapters': []})
+    keep.reload.assert_called_once(); gone.reload.assert_called_once()
+    assert list(adapter.resources) == [('site/a', False)]
+
+
+ALIAS_DEF = {'kind': 'alias', 'uai': ['site', 'pv', 'remote'], 'data_format': 'fake_pv', 'target_format': 'remote_fmt',
+             'publication_topic': 'devices/site/pv/all', 'transform': [{'#': 'transform(device_values())', 'kW': 'transform[W](scale(0.001))'}]}
+
+
+def test_a_locally_defined_topic_is_built_without_the_service(adapter):
+    """A remote topic with a definition in the configuration never reaches the resolve RPC and transforms as declared."""
+    adapter.config = MessageBusAdapterConfig(bus_type='mqtt', adapters=[{'name': 'r1', 'host': 'h', 'port': 1}],
+                                             definitions={'site/pv/remote': ALIAS_DEF})
+    resource = adapter._get_resource_data('site/pv/remote')
+    assert resource.origin == 'local' and resource.transform.execute([{'W': 2500}, {}]) == {'kW': 2.5}
+    adapter.vip.rpc.call.assert_not_called()
+    assert adapter.local_definitions() == {'site/pv/remote': MessageBusAdapterConfig(bus_type='mqtt', definitions={'site/pv/remote': ALIAS_DEF}).definitions['site/pv/remote'].model_dump(mode='json')}
+
+
+def test_reconfiguration_re_reads_or_removes_local_definitions(adapter):
+    """An update re-reads a changed definition in place and drops a resource whose definition went away."""
+    adapter.config = MessageBusAdapterConfig(bus_type='mqtt', adapters=[], definitions={'site/pv/remote': ALIAS_DEF, 'site/gone': ALIAS_DEF})
+    kept, gone = adapter._get_resource_data('site/pv/remote'), adapter._get_resource_data('site/gone')
+    changed = {**ALIAS_DEF, 'transform': [{'#': 'transform(device_values())', 'kW': 'transform[W](scale(0.01))'}]}
+    adapter.configure_main(None, 'UPDATE', {'bus_type': 'mqtt', 'adapters': [], 'definitions': {'site/pv/remote': changed}})
+    assert adapter.resources[('site/pv/remote', False)] is kept and kept.transform.execute([{'W': 2500}, {}]) == {'kW': 25.0}
+    assert ('site/gone', False) not in adapter.resources
 
